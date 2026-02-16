@@ -93,10 +93,134 @@ class Evaluation(Base):
         cascade="all, delete-orphan",
     )
 
+    # ✅ NEW: track configs enabled for this evaluation (multi-track engine)
+    tracks: Mapped[list["EvaluationTrack"]] = relationship(
+        back_populates="evaluation",
+        cascade="all, delete-orphan",
+    )
+
+
     __table_args__ = (
         Index("ix_evaluations_tenant_year", "tenant_name", "year"),
     )
 
+
+class AssessmentTrackTemplate(Base):
+    """
+    A reusable "track definition" (global library).
+
+    Examples:
+    - BOARD_AS_WHOLE
+    - CHAIR_EVAL (INED-only raters)
+    - DIRECTOR_SELF
+    - DIRECTOR_PEER
+    - COMMITTEE_EVAL
+    - GOV_AUDIT
+
+    These templates get enabled per evaluation via EvaluationTrack.
+    """
+
+    __tablename__ = "assessment_track_templates"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    code: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)  # e.g. "CHAIR_EVAL"
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Maps to AssessmentAssignment.assignment_type
+    assignment_type: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # Subject behavior:
+    # "NONE" | "PARTICIPANT_ROLE" | "PARTICIPANT_SELF" | "PARTICIPANT_EACH" | "COMMITTEE"
+    subject_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="NONE")
+    subject_role: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    # Stored as JSON for flexibility:
+    # {"mode":"ALL"} or {"mode":"ROLE_IN","roles":["INED"]}
+    respondent_rule: Mapped[Dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSONB),
+        default=dict,
+        nullable=False,
+    )
+
+    # Default instrument for this track (overridable per evaluation)
+    default_template_code: Mapped[str] = mapped_column(String(64), nullable=False, default="DEFAULT")
+    default_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    active: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    # Relationships
+    evaluation_tracks: Mapped[list["EvaluationTrack"]] = relationship(
+        back_populates="track_template",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        Index("ix_track_templates_code", "code"),
+        Index("ix_track_templates_active", "active"),
+    )
+
+
+class EvaluationTrack(Base):
+    """
+    Per-evaluation configuration: which track templates are enabled for an evaluation,
+    plus optional per-evaluation overrides (instrument + config).
+
+    This is what the consultant UX will manage.
+    """
+
+    __tablename__ = "evaluation_tracks"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    evaluation_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("evaluations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    track_template_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("assessment_track_templates.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+    enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    # Optional per-evaluation instrument override (if null, use template default -> else evaluation default)
+    instrument_template_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    instrument_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Track-specific config (committees list, inclusion rules, etc.)
+    config: Mapped[Dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSONB),
+        default=dict,
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    # Relationships
+    evaluation: Mapped["Evaluation"] = relationship(back_populates="tracks")
+    track_template: Mapped["AssessmentTrackTemplate"] = relationship(back_populates="evaluation_tracks")
+
+    __table_args__ = (
+        UniqueConstraint("evaluation_id", "track_template_id", name="uq_eval_track"),
+        Index("ix_eval_tracks_eval", "evaluation_id"),
+        Index("ix_eval_tracks_tpl", "track_template_id"),
+        Index("ix_eval_tracks_enabled", "enabled"),
+    )
 
 class Report(Base):
     """

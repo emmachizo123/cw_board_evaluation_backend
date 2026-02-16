@@ -37,18 +37,37 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _ensure_assignment_by_token(db: Session, token: str) -> AssessmentAssignment:
+def _ensure_assignment_by_token(
+    db: Session,
+    token: str,
+    *,
+    allow_completed: bool = False,
+) -> AssessmentAssignment:
+    """
+    Resolve an assignment from its access token.
+
+    Option 1A support:
+    - allow_completed=False (default): block responded assignments (used by question pages if you want)
+    - allow_completed=True: allow responded assignments (used by GET /responses and POST finalize=false)
+    """
     t = (token or "").strip()
     if not t:
         raise HTTPException(status_code=400, detail="Token is required.")
 
     a = (
-        db.execute(select(AssessmentAssignment).where(AssessmentAssignment.access_token == t))
+        db.execute(
+            select(AssessmentAssignment).where(AssessmentAssignment.access_token == t)
+        )
         .scalars()
         .first()
     )
     if not a:
         raise HTTPException(status_code=404, detail="Invalid or expired assignment link.")
+
+    # ✅ Only block completed when caller does NOT allow it
+    if not allow_completed and str(a.status or "").lower() == "responded":
+        raise HTTPException(status_code=409, detail="This assignment has already been completed.")
+
     return a
 
 
@@ -184,9 +203,12 @@ class PortalSubmitIn(BaseModel):
 # Routes
 # -------------------------
 
+
 @router.get("/portal/{token}", status_code=status.HTTP_200_OK, response_model=PortalLoadOut)
 def portal_load(token: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    a = _ensure_assignment_by_token(db, token)
+    # ✅ allow completed assignments to load (so invite/evaluation/thank-you can work for responded tokens)
+    a = _ensure_assignment_by_token(db, token, allow_completed=True)
+
     ev = _ensure_evaluation(db, a.evaluation_id)
 
     instrument = _instrument_from_assignment_or_eval(a, ev)
@@ -254,9 +276,14 @@ def portal_load(token: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
     }
 
 
+
 @router.get("/portal/{token}/responses", status_code=status.HTTP_200_OK)
-def portal_get_responses(token: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    a = _ensure_assignment_by_token(db, token)
+def portal_get_responses(
+    token: str,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    # ✅ allow completed (this is a read endpoint)
+    a = _ensure_assignment_by_token(db, token, allow_completed=True)
     ev = _ensure_evaluation(db, a.evaluation_id)
 
     instrument = _instrument_from_assignment_or_eval(a, ev)
@@ -303,7 +330,13 @@ def portal_submit_responses(
     finalize: bool = Query(default=False, description="If true, mark assignment as responded."),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    a = _ensure_assignment_by_token(db, token)
+    # ✅ Allow loading even if completed (so drafts can be saved)
+    a = _ensure_assignment_by_token(db, token, allow_completed=True)
+
+    # ✅ Option 1A: allow saving drafts after responded, but block re-finalize
+    if str(a.status or "").lower() == "responded" and finalize:
+        raise HTTPException(status_code=409, detail="This assignment has already been completed.")
+
     ev = _ensure_evaluation(db, a.evaluation_id)
 
     instrument = _instrument_from_assignment_or_eval(a, ev)
@@ -323,8 +356,6 @@ def portal_submit_responses(
     skipped = 0
 
     for ans in payload.answers:
-        #q = q_by_id.get(str(ans.question_id))
-
         qid = (str(ans.question_id) if ans.question_id is not None else "").strip()
         q = q_by_id.get(qid)
 
@@ -353,8 +384,8 @@ def portal_submit_responses(
             db.add(
                 Response(
                     evaluation_id=ev.id,
-                    participant_id=a.respondent_participant_id,  # keep for joins/analytics
-                    assignment_id=a.id,                          # ✅ per-assignment uniqueness
+                    participant_id=a.respondent_participant_id,
+                    assignment_id=a.id,
                     question_id=q.id,
                     score=ans.score,
                     comment=ans.comment,
@@ -363,7 +394,6 @@ def portal_submit_responses(
             created += 1
 
     if finalize:
-        # Always stamp responded_at when finalize is called (safe + idempotent)
         if a.status != "responded":
             a.status = "responded"
         a.responded_at = _utcnow()

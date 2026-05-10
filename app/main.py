@@ -5,6 +5,9 @@ FastAPI entrypoint for the C&W Board Evaluation Platform.
 
 Run:
     uvicorn app.main:app --reload
+
+Database schema is not created at startup. Apply migrations first:
+    alembic upgrade head
 """
 
 from dotenv import load_dotenv, find_dotenv
@@ -12,8 +15,6 @@ load_dotenv(find_dotenv(), override=False)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-from app.db.session import init_db
 
 from app.api.reports import router as reports_router
 from app.api.evaluations import router as evaluations_router
@@ -43,10 +44,6 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    @app.on_event("startup")
-    async def on_startup() -> None:
-        init_db()
 
     app.include_router(reports_router, prefix="/api/v1", tags=["reports"])
     app.include_router(evaluations_router, prefix="/api/v1", tags=["evaluations"])

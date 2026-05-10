@@ -7,7 +7,7 @@ Exposes:
 - engine
 - SessionLocal
 - get_db() dependency (FastAPI)
-- init_db() (MVP table creation; later replace with Alembic)
+- init_db() — no-op; schema is applied with Alembic (`alembic upgrade head`)
 """
 
 from __future__ import annotations
@@ -39,7 +39,10 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
-    """Create tables (MVP convenience)."""
-    from app.db.models import Base  # local import avoids circular imports
+    """
+    Reserved hook (no-op). All DDL is managed by Alembic migrations.
 
-    Base.metadata.create_all(bind=engine)
+    Before running the API locally or in CI:
+      alembic upgrade head
+    """
+    return

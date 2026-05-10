@@ -28,7 +28,6 @@ NEW (Assignments):
 
 from __future__ import annotations
 
-import os
 import random
 import secrets
 from datetime import datetime, timezone
@@ -54,8 +53,12 @@ from app.db.models import (
 )
 
 from app.services.email_service import send_invite_email
+from app.util.portal_urls import assignment_portal_url
 
 router = APIRouter()
+
+# Backwards-compatible alias (assignment tokens only; not participant tokens)
+_make_portal_url = assignment_portal_url
 
 
 # -------------------------
@@ -86,33 +89,28 @@ def _get_questions_for_instrument(db: Session, template_code: str, version: int)
     )
 
 
-def _portal_base_url() -> str:
-    """
-    Return the base URL used to generate portal links.
-
-    Configure per environment:
-      - PARTICIPANT_PORTAL_BASE_URL=http://localhost:5173     (local dev)
-      - PARTICIPANT_PORTAL_BASE_URL=https://cw.example.com    (production)
-
-    The final portal link (matches your React routes) is:
-      <base>/member/<token>/questions
-    """
-    base = (os.getenv("PARTICIPANT_PORTAL_BASE_URL") or "http://localhost:5173").strip()
-    return base.rstrip("/")
-
-
-def _make_portal_url(token: str) -> str:
-    """
-    Build the full Board Member portal URL for an *assignment* token
-    (and still works for participant tokens in legacy flows).
-
-    React Router:
-      /member/:token/questions
-    """
-    t = (token or "").strip()
-    if not t:
-        return ""
-    return f"{_portal_base_url()}/member/{t}/questions"
+def _assignment_portal_urls_for_respondent(
+    db: Session,
+    evaluation_id: str,
+    respondent_participant_id,
+) -> List[str]:
+    """Full portal URLs for assignments where this participant is the respondent (ordered by created_at)."""
+    rows = (
+        db.execute(
+            select(AssessmentAssignment)
+            .where(AssessmentAssignment.evaluation_id == evaluation_id)
+            .where(AssessmentAssignment.respondent_participant_id == respondent_participant_id)
+            .order_by(AssessmentAssignment.created_at.asc())
+        )
+        .scalars()
+        .all()
+    )
+    out: List[str] = []
+    for a in rows:
+        t = (getattr(a, "access_token", None) or "").strip()
+        if t:
+            out.append(assignment_portal_url(t))
+    return out
 
 
 def _generate_unique_token_for_model(db: Session, model_cls, token_attr: str, max_tries: int = 8) -> str:
@@ -369,8 +367,11 @@ class GenerateAssignmentsRequest(BaseModel):
     Generate AssessmentAssignment rows from enabled evaluation_tracks.
 
     dry_run=True will compute what WOULD be created, but will not write to DB.
+    send_email_notifications: if True and dry_run is False, email each respondent
+    their portal link(s) (requires EMAIL_ENABLED and SMTP).
     """
     dry_run: bool = Field(default=False)
+    send_email_notifications: bool = Field(default=False)
 
 
 
@@ -589,12 +590,13 @@ def invite_participants(
                 db.add(existing)
                 db.flush()
 
-            portal_url = _make_portal_url(existing.access_token)
+            assignment_urls = _assignment_portal_urls_for_respondent(db, evaluation_id, existing.id)
+            primary_portal_url = assignment_urls[0] if assignment_urls else None
 
             email_ok, email_err = send_invite_email(
                 to_email=existing.email,
                 full_name=existing.full_name,
-                portal_url=portal_url,
+                portal_url=primary_portal_url or "",
                 evaluation_id=evaluation_id,
                 tenant_name=tenant_name,
             )
@@ -608,7 +610,9 @@ def invite_participants(
                     "status": existing.status,
                     "invited_at": existing.invited_at.isoformat() if existing.invited_at else None,
                     "responded_at": existing.responded_at.isoformat() if existing.responded_at else None,
-                    "portal_url": portal_url,
+                    "portal_url": primary_portal_url,
+                    "assignment_portal_urls": assignment_urls,
+                    "portal_status": "ready" if assignment_urls else "pending_assignments",
                     "email_sent": bool(email_ok),
                     "email_error": email_err,
                 }
@@ -632,12 +636,13 @@ def invite_participants(
         db.flush()
         created += 1
 
-        portal_url = _make_portal_url(p.access_token)
+        assignment_urls = _assignment_portal_urls_for_respondent(db, evaluation_id, p.id)
+        primary_portal_url = assignment_urls[0] if assignment_urls else None
 
         email_ok, email_err = send_invite_email(
             to_email=p.email,
             full_name=p.full_name,
-            portal_url=portal_url,
+            portal_url=primary_portal_url or "",
             evaluation_id=evaluation_id,
             tenant_name=tenant_name,
         )
@@ -651,7 +656,9 @@ def invite_participants(
                 "status": p.status,
                 "invited_at": p.invited_at.isoformat() if p.invited_at else None,
                 "responded_at": p.responded_at.isoformat() if p.responded_at else None,
-                "portal_url": portal_url,
+                "portal_url": primary_portal_url,
+                "assignment_portal_urls": assignment_urls,
+                "portal_status": "ready" if assignment_urls else "pending_assignments",
                 "email_sent": bool(email_ok),
                 "email_error": email_err,
             }
@@ -672,6 +679,10 @@ def invite_participants(
         "total_now": len(total_now),
         "created_items": created_items,
         "existing_items": existing_items,
+        "portal_note": (
+            "portal_url is an assignment questionnaire link (first of assignment_portal_urls). "
+            "It is null until tracks are enabled and assignments are generated for this participant."
+        ),
     }
 
 
@@ -701,6 +712,9 @@ def list_participants(evaluation_id: str, db: Session = Depends(get_db)) -> Dict
             db.flush()
             backfilled = True
 
+        assignment_urls = _assignment_portal_urls_for_respondent(db, evaluation_id, p.id)
+        primary_portal_url = assignment_urls[0] if assignment_urls else None
+
         items.append(
             {
                 "participant_id": str(p.id),
@@ -710,14 +724,24 @@ def list_participants(evaluation_id: str, db: Session = Depends(get_db)) -> Dict
                 "status": p.status,
                 "invited_at": p.invited_at.isoformat() if p.invited_at else None,
                 "responded_at": p.responded_at.isoformat() if p.responded_at else None,
-                "portal_url": _make_portal_url(p.access_token),
+                "portal_url": primary_portal_url,
+                "assignment_portal_urls": assignment_urls,
+                "portal_status": "ready" if assignment_urls else "pending_assignments",
             }
         )
 
     if backfilled:
         db.commit()
 
-    return {"evaluation_id": evaluation_id, "count": len(items), "items": items}
+    return {
+        "evaluation_id": evaluation_id,
+        "count": len(items),
+        "items": items,
+        "portal_note": (
+            "portal_url is the first assignment questionnaire link for this participant. "
+            "Use GET .../assignments for the full list. Null until assignments exist."
+        ),
+    }
 
 
 # -------------------------
@@ -1311,8 +1335,41 @@ def generate_assignments_from_tracks(
                 created += 1
                 _emit(a, tpl)
 
+    email_sent = 0
+    email_failed: List[Dict[str, Any]] = []
+
     if not dry_run:
         db.commit()
+
+        if payload.send_email_notifications and items:
+            from collections import defaultdict
+            from uuid import UUID as _UUID
+
+            from app.services.email_service import send_assignment_links_digest_email
+
+            tenant_name = ev.tenant_name
+            by_respondent: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+            for it in items:
+                rid = it.get("respondent_participant_id")
+                if rid:
+                    by_respondent[str(rid)].append(it)
+
+            for rid_str, group_items in by_respondent.items():
+                p = db.get(Participant, _UUID(rid_str))
+                if not p or not (p.email or "").strip():
+                    email_failed.append({"respondent_participant_id": rid_str, "error": "no email on participant"})
+                    continue
+                ok, err = send_assignment_links_digest_email(
+                    to_email=p.email,
+                    full_name=p.full_name,
+                    evaluation_id=evaluation_id,
+                    tenant_name=tenant_name,
+                    links=group_items,
+                )
+                if ok:
+                    email_sent += 1
+                else:
+                    email_failed.append({"email": p.email, "error": err})
 
     return {
         "evaluation_id": evaluation_id,
@@ -1322,6 +1379,8 @@ def generate_assignments_from_tracks(
         "skipped": skipped,
         "count": len(items) if not dry_run else None,
         "items": items if not dry_run else None,
+        "email_sent": email_sent if not dry_run else None,
+        "email_failed": email_failed if not dry_run and payload.send_email_notifications else None,
     }
 
 
